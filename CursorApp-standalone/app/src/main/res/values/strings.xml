@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Cursor</string>
+    <string name="service_description">Shows a small trackpad in the top right and a cursor that can tap, drag and swipe anywhere on the screen.</string>
+</resources>
