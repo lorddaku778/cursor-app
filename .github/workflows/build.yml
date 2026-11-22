@@ -13,12 +13,53 @@ jobs:
           java-version: 17
       - name: Accept Android SDK licenses
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Show repo files
+        run: find . -path ./.git -prune -o -type f -print | head -50
+      - name: Prepare project
+        run: |
+          M=$(find . -path ./.git -prune -o -name AndroidManifest.xml -print | head -1)
+          echo "Manifest: $M"
+          test -n "$M" || { echo "No AndroidManifest.xml in repo - upload the app folder"; exit 1; }
+          ROOT=$(dirname "$(dirname "$(dirname "$(dirname "$M")")")")
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          cd "$ROOT"
+          [ -f settings.gradle.kts ] || cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "CursorApp"
+          include(":app")
+          EOF
+          mkdir -p gradle
+          [ -f gradle/libs.versions.toml ] || cat > gradle/libs.versions.toml <<'EOF'
+          [versions]
+          agp = "9.0.1"
+
+          [plugins]
+          android-application = { id = "com.android.application", version.ref = "agp" }
+          EOF
+          [ -f build.gradle.kts ] || cat > build.gradle.kts <<'EOF'
+          plugins {
+              alias(libs.plugins.android.application) apply false
+          }
+          EOF
+          [ -f gradle.properties ] || printf 'org.gradle.jvmargs=-Xmx2048m\nandroid.useAndroidX=true\nandroid.nonTransitiveRClass=true\nandroid.suppressUnsupportedCompileSdk=37.1\n' > gradle.properties
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 9.4.1
       - name: Build
-        run: gradle :app:assembleDebug --stacktrace
+        run: cd "$ROOT" && gradle :app:assembleDebug --stacktrace
       - uses: actions/upload-artifact@v4
         with:
           name: Cursor-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ env.ROOT }}/app/build/outputs/apk/debug/app-debug.apk
