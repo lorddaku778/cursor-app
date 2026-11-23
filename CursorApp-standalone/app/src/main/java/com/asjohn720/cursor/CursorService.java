@@ -3,7 +3,14 @@ package com.asjohn720.cursor;
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.GestureDescription;
 import android.accessibilityservice.GestureDescription.StrokeDescription;
+import android.app.KeyguardManager;
+import android.content.BroadcastReceiver;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.res.Configuration;
+import android.provider.Settings;
+import java.util.regex.Pattern;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -48,6 +55,19 @@ public class CursorService extends AccessibilityService {
     private float cx, cy;
     private boolean expanded = true;
 
+    // Hidden while the scooter is locked / the screen is off.
+    private boolean screenOff, lockedByApp;
+    private static final Pattern LOCK_NAME = Pattern.compile("(?i)(^|[._$])lock");
+    private final BroadcastReceiver screenRx = new BroadcastReceiver() {
+        @Override public void onReceive(Context c, Intent i) {
+            String a = i.getAction();
+            if (Intent.ACTION_SCREEN_OFF.equals(a)) screenOff = true;
+            else if (Intent.ACTION_SCREEN_ON.equals(a) || Intent.ACTION_USER_PRESENT.equals(a)) screenOff = false;
+            if (Intent.ACTION_USER_PRESENT.equals(a)) lockedByApp = false;
+            applyVisibility();
+        }
+    };
+
     // drag state
     private boolean dragging, dragEnding, dragInFlight, dragFirst;
     private StrokeDescription dragStroke;
@@ -68,10 +88,58 @@ public class CursorService extends AccessibilityService {
         instance = this;
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         build();
+        IntentFilter f = new IntentFilter();
+        f.addAction(Intent.ACTION_SCREEN_OFF);
+        f.addAction(Intent.ACTION_SCREEN_ON);
+        f.addAction(Intent.ACTION_USER_PRESENT);
+        registerReceiver(screenRx, f);
+        applyVisibility();
     }
 
+    /**
+     * Spots the scooter's own lock screen. Android's keyguard is covered by KeyguardManager;
+     * a lock screen that is just an app is recognised by a name starting with "lock", or by
+     * a package listed in Settings.Global "s1_cursor_hide_pkgs" (comma separated).
+     */
     @Override
-    public void onAccessibilityEvent(AccessibilityEvent event) { }
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+        if (event == null || event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return;
+        String p = event.getPackageName() == null ? "" : event.getPackageName().toString();
+        String c = event.getClassName() == null ? "" : event.getClassName().toString();
+        if (p.isEmpty() || p.equals(getPackageName()) || p.equals("com.android.systemui")
+                || p.contains("inputmethod")) return;
+        boolean lock = LOCK_NAME.matcher(p).find() || LOCK_NAME.matcher(c).find();
+        if (!lock) {
+            try {
+                String custom = Settings.Global.getString(getContentResolver(), "s1_cursor_hide_pkgs");
+                if (custom != null) {
+                    for (String x : custom.split(",")) if (x.trim().equals(p)) { lock = true; break; }
+                }
+            } catch (Exception ignored) { }
+        }
+        if (lock != lockedByApp) {
+            lockedByApp = lock;
+            applyVisibility();
+        }
+    }
+
+    private boolean isLocked() {
+        boolean keyguard = false;
+        try {
+            KeyguardManager km = (KeyguardManager) getSystemService(KEYGUARD_SERVICE);
+            keyguard = km != null && km.isKeyguardLocked();
+        } catch (Exception ignored) { }
+        return screenOff || keyguard || lockedByApp;
+    }
+
+    private void applyVisibility() {
+        if (pad == null || cursorView == null || bubble == null) return;
+        boolean hide = isLocked();
+        if (hide) endDragNow();
+        pad.setVisibility(!hide && expanded ? View.VISIBLE : View.GONE);
+        cursorView.setVisibility(!hide && expanded ? View.VISIBLE : View.GONE);
+        bubble.setVisibility(!hide && !expanded ? View.VISIBLE : View.GONE);
+    }
 
     @Override
     public void onInterrupt() { }
@@ -87,6 +155,7 @@ public class CursorService extends AccessibilityService {
 
     @Override
     public void onDestroy() {
+        try { unregisterReceiver(screenRx); } catch (Exception ignored) { }
         teardown();
         instance = null;
         super.onDestroy();
@@ -190,7 +259,7 @@ public class CursorService extends AccessibilityService {
         bubbleLp = lp(dp(44), dp(44), sw - dp(44) - margin, margin, true);
         wm.addView(bubble, bubbleLp);
 
-        setExpanded(expanded);
+        applyVisibility();
     }
 
     private void addButton(LinearLayout row, String label, final Runnable action) {
@@ -207,10 +276,7 @@ public class CursorService extends AccessibilityService {
 
     private void setExpanded(boolean on) {
         expanded = on;
-        if (pad == null) return;
-        pad.setVisibility(on ? View.VISIBLE : View.GONE);
-        cursorView.setVisibility(on ? View.VISIBLE : View.GONE);
-        bubble.setVisibility(on ? View.GONE : View.VISIBLE);
+        applyVisibility();
     }
 
     private void teardown() {
