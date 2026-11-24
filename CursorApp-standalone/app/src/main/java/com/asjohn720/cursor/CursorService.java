@@ -9,7 +9,14 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.res.Configuration;
+import android.content.SharedPreferences;
 import android.provider.Settings;
+import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityWindowInfo;
+import android.widget.Toast;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.regex.Pattern;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -57,6 +64,7 @@ public class CursorService extends AccessibilityService {
 
     // Hidden while the scooter is locked / the screen is off.
     private boolean screenOff, lockedByApp;
+    private TextView surfaceLabel;
     private static final Pattern LOCK_NAME = Pattern.compile("(?i)(^|[._$])lock");
     private final BroadcastReceiver screenRx = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
@@ -97,30 +105,91 @@ public class CursorService extends AccessibilityService {
     }
 
     /**
-     * Spots the scooter's own lock screen. Android's keyguard is covered by KeyguardManager;
-     * a lock screen that is just an app is recognised by a name starting with "lock", or by
-     * a package listed in Settings.Global "s1_cursor_hide_pkgs" (comma separated).
+     * Works out which app is really on screen (ignoring our own overlays, the Smart Ball and
+     * the system bars) and hides the trackpad when that is a lock screen. A screen counts as a
+     * lock screen if its name starts with "lock", or if you taught it with the "Lock" button.
      */
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (event == null || event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return;
-        String p = event.getPackageName() == null ? "" : event.getPackageName().toString();
-        String c = event.getClassName() == null ? "" : event.getClassName().toString();
-        if (p.isEmpty() || p.equals(getPackageName()) || p.equals("com.android.systemui")
-                || p.contains("inputmethod")) return;
-        boolean lock = LOCK_NAME.matcher(p).find() || LOCK_NAME.matcher(c).find();
-        if (!lock) {
-            try {
-                String custom = Settings.Global.getString(getContentResolver(), "s1_cursor_hide_pkgs");
-                if (custom != null) {
-                    for (String x : custom.split(",")) if (x.trim().equals(p)) { lock = true; break; }
+        if (event == null) return;
+        int t = event.getEventType();
+        if (t != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+                && t != AccessibilityEvent.TYPE_WINDOWS_CHANGED) return;
+        ui.post(new Runnable() { @Override public void run() { evaluateTop(); } });
+    }
+
+    private String topPkg = "";
+    private String topTitle = "";
+
+    private void evaluateTop() {
+        String p = null, title = "";
+        try {
+            List<AccessibilityWindowInfo> ws = getWindows();
+            if (ws != null) {
+                for (AccessibilityWindowInfo w : ws) {
+                    AccessibilityNodeInfo r = w.getRoot();
+                    String pk = (r == null || r.getPackageName() == null) ? null : r.getPackageName().toString();
+                    CharSequence ti = w.getTitle();
+                    if (r != null) r.recycle();
+                    if (pk == null) continue;
+                    if (pk.startsWith("com.asjohn720.") || pk.equals("com.android.systemui")
+                            || pk.contains("inputmethod")) continue;
+                    p = pk;
+                    title = ti == null ? "" : ti.toString();
+                    break;
                 }
-            } catch (Exception ignored) { }
-        }
+            }
+        } catch (Exception ignored) { }
+        if (p == null) { updateStatusLabel(); return; }
+        topPkg = p;
+        topTitle = title;
+
+        boolean lock = LOCK_NAME.matcher(p).find() || LOCK_NAME.matcher(title).find()
+                || hidePkgs().contains(p);
         if (lock != lockedByApp) {
             lockedByApp = lock;
             applyVisibility();
         }
+        updateStatusLabel();
+    }
+
+    private Set<String> hidePkgs() {
+        Set<String> out = new HashSet<>();
+        try {
+            SharedPreferences sp = getSharedPreferences("cursor", MODE_PRIVATE);
+            out.addAll(sp.getStringSet("hide_pkgs", new HashSet<String>()));
+            String custom = Settings.Global.getString(getContentResolver(), "s1_cursor_hide_pkgs");
+            if (custom != null) for (String x : custom.split(",")) out.add(x.trim());
+        } catch (Exception ignored) { }
+        return out;
+    }
+
+    /** "Lock" button: remember the app that is on screen right now as a lock screen. */
+    private void markThisScreenAsLock() {
+        evaluateTop();
+        if (topPkg.isEmpty()) {
+            Toast.makeText(this, "Could not see this screen", Toast.LENGTH_LONG).show();
+            return;
+        }
+        SharedPreferences sp = getSharedPreferences("cursor", MODE_PRIVATE);
+        Set<String> set = new HashSet<>(sp.getStringSet("hide_pkgs", new HashSet<String>()));
+        set.add(topPkg);
+        sp.edit().putStringSet("hide_pkgs", set).apply();
+        Toast.makeText(this, "Cursor will hide on " + topPkg, Toast.LENGTH_LONG).show();
+        evaluateTop();
+    }
+
+    private void resetHideList() {
+        getSharedPreferences("cursor", MODE_PRIVATE).edit().remove("hide_pkgs").apply();
+        Toast.makeText(this, "Hide list cleared", Toast.LENGTH_SHORT).show();
+        evaluateTop();
+    }
+
+    private void updateStatusLabel() {
+        if (surfaceLabel == null) return;
+        String shown = topPkg.isEmpty() ? "unknown" : topPkg;
+        surfaceLabel.setText("TRACKPAD\nslide: move   tap: click\nhold + slide: drag / swipe\n\nScreen: " + shown
+                + "\nOn a lock screen? tap Lock");
     }
 
     private boolean isLocked() {
@@ -217,6 +286,7 @@ public class CursorService extends AccessibilityService {
         pad.setBackground(bg);
 
         TextView surface = new TextView(this);
+        surfaceLabel = surface;
         surface.setText("TRACKPAD\nslide: move   tap: click\nhold + slide: drag / swipe");
         surface.setTextColor(0xFF6E6E6E);
         surface.setTextSize(11);
@@ -236,6 +306,10 @@ public class CursorService extends AccessibilityService {
         addButton(row, "Up", new Runnable() { @Override public void run() { scroll(true); } });
         addButton(row, "Down", new Runnable() { @Override public void run() { scroll(false); } });
         addButton(row, "Click", new Runnable() { @Override public void run() { click(cx, cy); } });
+        addButton(row, "Lock", new Runnable() { @Override public void run() { markThisScreenAsLock(); } });
+        row.getChildAt(row.getChildCount() - 1).setOnLongClickListener(new View.OnLongClickListener() {
+            @Override public boolean onLongClick(View v) { resetHideList(); return true; }
+        });
         addButton(row, "Hide", new Runnable() { @Override public void run() { setExpanded(false); } });
 
         padLp = lp(padW, padH, padX, padY, true);
@@ -260,6 +334,7 @@ public class CursorService extends AccessibilityService {
         wm.addView(bubble, bubbleLp);
 
         applyVisibility();
+        evaluateTop();
     }
 
     private void addButton(LinearLayout row, String label, final Runnable action) {
