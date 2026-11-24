@@ -14,7 +14,9 @@ import android.provider.Settings;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
 import android.widget.Toast;
+import java.util.ArrayDeque;
 import java.util.HashSet;
+import java.util.TreeSet;
 import java.util.List;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -121,31 +123,80 @@ public class CursorService extends AccessibilityService {
     private String topPkg = "";
     private String topTitle = "";
 
-    private void evaluateTop() {
-        String p = null, title = "";
+    /** What is on screen right now: the app, the window title and the words visible in it. */
+    private static class Top {
+        String pkg = "", title = "";
+        Set<String> texts = new TreeSet<>();
+    }
+
+    private Top readTop(boolean withTexts) {
         try {
             List<AccessibilityWindowInfo> ws = getWindows();
-            if (ws != null) {
-                for (AccessibilityWindowInfo w : ws) {
-                    AccessibilityNodeInfo r = w.getRoot();
-                    String pk = (r == null || r.getPackageName() == null) ? null : r.getPackageName().toString();
-                    CharSequence ti = w.getTitle();
-                    if (r != null) r.recycle();
-                    if (pk == null) continue;
-                    if (pk.startsWith("com.asjohn720.") || pk.equals("com.android.systemui")
-                            || pk.contains("inputmethod")) continue;
-                    p = pk;
-                    title = ti == null ? "" : ti.toString();
-                    break;
-                }
+            if (ws == null) return null;
+            for (AccessibilityWindowInfo w : ws) {
+                AccessibilityNodeInfo r = w.getRoot();
+                if (r == null || r.getPackageName() == null) continue;
+                String pk = r.getPackageName().toString();
+                if (pk.startsWith("com.asjohn720.") || pk.equals("com.android.systemui")
+                        || pk.contains("inputmethod")) continue;
+                Top t = new Top();
+                t.pkg = pk;
+                t.title = w.getTitle() == null ? "" : w.getTitle().toString();
+                if (withTexts) collectTexts(r, t.texts);
+                return t;
             }
         } catch (Exception ignored) { }
-        if (p == null) { updateStatusLabel(); return; }
-        topPkg = p;
-        topTitle = title;
+        return null;
+    }
 
-        boolean lock = LOCK_NAME.matcher(p).find() || LOCK_NAME.matcher(title).find()
-                || hidePkgs().contains(p);
+    /** Words on the screen. Anything with a digit (clock, battery %, speed) is skipped as it changes. */
+    private void collectTexts(AccessibilityNodeInfo root, Set<String> out) {
+        ArrayDeque<AccessibilityNodeInfo> q = new ArrayDeque<>();
+        q.add(root);
+        int seen = 0;
+        while (!q.isEmpty() && seen < 300) {
+            AccessibilityNodeInfo x = q.poll();
+            seen++;
+            CharSequence t = x.getText();
+            if (t == null || t.length() == 0) t = x.getContentDescription();
+            if (t != null) {
+                String v = t.toString().trim();
+                if (v.length() > 0 && v.length() <= 40 && !v.matches(".*\\d.*")) out.add(v);
+            }
+            for (int i = 0; i < x.getChildCount(); i++) {
+                AccessibilityNodeInfo c = x.getChild(i);
+                if (c != null) q.add(c);
+            }
+        }
+    }
+
+    private Set<String> savedSigs() {
+        SharedPreferences sp = getSharedPreferences("cursor", MODE_PRIVATE);
+        return new HashSet<>(sp.getStringSet("hide_sigs", new HashSet<String>()));
+    }
+
+    private void evaluateTop() {
+        Top peek = readTop(false);
+        if (peek == null) { updateStatusLabel(); return; }
+        topPkg = peek.pkg;
+        topTitle = peek.title;
+
+        boolean lock = LOCK_NAME.matcher(peek.pkg).find() || LOCK_NAME.matcher(peek.title).find();
+        if (!lock) {
+            try {
+                String custom = Settings.Global.getString(getContentResolver(), "s1_cursor_hide_pkgs");
+                if (custom != null) for (String x : custom.split(",")) if (x.trim().equals(peek.pkg)) lock = true;
+            } catch (Exception ignored) { }
+        }
+        if (!lock) {
+            Set<String> sigs = savedSigs();
+            boolean candidate = false;
+            for (String sg : sigs) if (sg.startsWith(peek.pkg + "\t")) { candidate = true; break; }
+            if (candidate) {
+                Top full = readTop(true);
+                if (full != null) lock = matchesSaved(sigs, full);
+            }
+        }
         if (lock != lockedByApp) {
             lockedByApp = lock;
             applyVisibility();
@@ -153,41 +204,55 @@ public class CursorService extends AccessibilityService {
         updateStatusLabel();
     }
 
-    private Set<String> hidePkgs() {
-        Set<String> out = new HashSet<>();
-        try {
-            SharedPreferences sp = getSharedPreferences("cursor", MODE_PRIVATE);
-            out.addAll(sp.getStringSet("hide_pkgs", new HashSet<String>()));
-            String custom = Settings.Global.getString(getContentResolver(), "s1_cursor_hide_pkgs");
-            if (custom != null) for (String x : custom.split(",")) out.add(x.trim());
-        } catch (Exception ignored) { }
-        return out;
+    /** A saved screen matches when the app and title are equal and every saved word is visible. */
+    private boolean matchesSaved(Set<String> sigs, Top t) {
+        for (String sg : sigs) {
+            String[] parts = sg.split("\t", 3);
+            if (parts.length < 2 || !parts[0].equals(t.pkg) || !parts[1].equals(t.title)) continue;
+            boolean all = true;
+            if (parts.length > 2 && !parts[2].isEmpty()) {
+                for (String need : parts[2].split("\u0001")) {
+                    if (!t.texts.contains(need)) { all = false; break; }
+                }
+            }
+            if (all) return true;
+        }
+        return false;
     }
 
-    /** "Lock" button: remember the app that is on screen right now as a lock screen. */
+    /** "Lock" button: remember exactly what is on screen now (not the whole app) as a lock screen. */
     private void markThisScreenAsLock() {
-        evaluateTop();
-        if (topPkg.isEmpty()) {
+        Top t = readTop(true);
+        if (t == null) {
             Toast.makeText(this, "Could not see this screen", Toast.LENGTH_LONG).show();
             return;
         }
+        StringBuilder words = new StringBuilder();
+        int n = 0;
+        for (String w : t.texts) {
+            if (n++ >= 12) break;
+            if (words.length() > 0) words.append('\u0001');
+            words.append(w);
+        }
         SharedPreferences sp = getSharedPreferences("cursor", MODE_PRIVATE);
-        Set<String> set = new HashSet<>(sp.getStringSet("hide_pkgs", new HashSet<String>()));
-        set.add(topPkg);
-        sp.edit().putStringSet("hide_pkgs", set).apply();
-        Toast.makeText(this, "Cursor will hide on " + topPkg, Toast.LENGTH_LONG).show();
+        Set<String> set = savedSigs();
+        set.add(t.pkg + "\t" + t.title + "\t" + words);
+        sp.edit().putStringSet("hide_sigs", set).remove("hide_pkgs").apply();
+        Toast.makeText(this, "Saved this screen (" + n + " words). Cursor hides here only.", Toast.LENGTH_LONG).show();
         evaluateTop();
     }
 
     private void resetHideList() {
-        getSharedPreferences("cursor", MODE_PRIVATE).edit().remove("hide_pkgs").apply();
+        getSharedPreferences("cursor", MODE_PRIVATE).edit().remove("hide_sigs").remove("hide_pkgs").apply();
         Toast.makeText(this, "Hide list cleared", Toast.LENGTH_SHORT).show();
+        lockedByApp = false;
+        applyVisibility();
         evaluateTop();
     }
 
     private void updateStatusLabel() {
         if (surfaceLabel == null) return;
-        String shown = topPkg.isEmpty() ? "unknown" : topPkg;
+        String shown = topPkg.isEmpty() ? "unknown" : topPkg + (topTitle.isEmpty() ? "" : " / " + topTitle);
         surfaceLabel.setText("TRACKPAD\nslide: move   tap: click\nhold + slide: drag / swipe\n\nScreen: " + shown
                 + "\nOn a lock screen? tap Lock");
     }
