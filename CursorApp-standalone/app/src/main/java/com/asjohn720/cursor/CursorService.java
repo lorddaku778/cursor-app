@@ -62,7 +62,15 @@ public class CursorService extends AccessibilityService {
     private WindowManager.LayoutParams cursorLp, padLp, bubbleLp;
 
     private float cx, cy;
-    private boolean expanded = true;
+    // Starts hidden. Tapping the Cursor app shows it; it hides again after 5 minutes without use.
+    private boolean expanded = false;
+    private static final long HIDE_AFTER_MS = 5 * 60 * 1000L;
+    private final Runnable autoHide = new Runnable() {
+        @Override public void run() {
+            setExpanded(false);
+            Toast.makeText(CursorService.this, "Cursor hidden", Toast.LENGTH_SHORT).show();
+        }
+    };
 
     // Hidden while the scooter is locked / the screen is off.
     private boolean screenOff, lockedByApp;
@@ -71,7 +79,7 @@ public class CursorService extends AccessibilityService {
     private final BroadcastReceiver screenRx = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
             String a = i.getAction();
-            if (Intent.ACTION_SCREEN_OFF.equals(a)) screenOff = true;
+            if (Intent.ACTION_SCREEN_OFF.equals(a)) { screenOff = true; setExpanded(false); }
             else if (Intent.ACTION_SCREEN_ON.equals(a) || Intent.ACTION_USER_PRESENT.equals(a)) screenOff = false;
             if (Intent.ACTION_USER_PRESENT.equals(a)) lockedByApp = false;
             applyVisibility();
@@ -272,7 +280,7 @@ public class CursorService extends AccessibilityService {
         if (hide) endDragNow();
         pad.setVisibility(!hide && expanded ? View.VISIBLE : View.GONE);
         cursorView.setVisibility(!hide && expanded ? View.VISIBLE : View.GONE);
-        bubble.setVisibility(!hide && !expanded ? View.VISIBLE : View.GONE);
+        bubble.setVisibility(View.GONE);
     }
 
     @Override
@@ -289,6 +297,7 @@ public class CursorService extends AccessibilityService {
 
     @Override
     public void onDestroy() {
+        ui.removeCallbacks(autoHide);
         try { unregisterReceiver(screenRx); } catch (Exception ignored) { }
         teardown();
         instance = null;
@@ -297,7 +306,12 @@ public class CursorService extends AccessibilityService {
 
     void toggle() {
         ui.post(new Runnable() {
-            @Override public void run() { setExpanded(!expanded); }
+            @Override public void run() {
+                setExpanded(!expanded);
+                Toast.makeText(CursorService.this, expanded
+                        ? "Cursor on. It hides after 5 minutes without touch."
+                        : "Cursor off", Toast.LENGTH_SHORT).show();
+            }
         });
     }
 
@@ -409,7 +423,7 @@ public class CursorService extends AccessibilityService {
         b.setTextSize(12);
         b.setGravity(Gravity.CENTER);
         b.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { action.run(); }
+            @Override public void onClick(View v) { restartTimer(); action.run(); }
         });
         row.addView(b, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f));
     }
@@ -417,6 +431,13 @@ public class CursorService extends AccessibilityService {
     private void setExpanded(boolean on) {
         expanded = on;
         applyVisibility();
+        if (on) restartTimer(); else ui.removeCallbacks(autoHide);
+    }
+
+    /** Any touch on the trackpad starts the 5 minutes again. */
+    private void restartTimer() {
+        ui.removeCallbacks(autoHide);
+        if (expanded) ui.postDelayed(autoHide, HIDE_AFTER_MS);
     }
 
     private void teardown() {
@@ -474,6 +495,7 @@ public class CursorService extends AccessibilityService {
     private boolean onPadTouch(MotionEvent e) {
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                restartTimer();
                 downX = lastX = e.getRawX();
                 downY = lastY = e.getRawY();
                 downTime = e.getEventTime();
